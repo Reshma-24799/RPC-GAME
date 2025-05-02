@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Rock-Paper-Scissors Arena</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f5f5f5;
+            margin: 20px;
+        }
+
+        #container {
+            max-width: 900px;
+            margin: auto;
+            background: #fff;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            font-size: 24px;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        #messages, #playerStatus {
+            border: 1px solid #ccc;
+            height: 250px;
+            overflow-y: scroll;
+            background: #fafafa;
+            padding: 10px;
+            font-size: 14px;
+            white-space: pre-wrap;
+        }
+
+        input, button {
+            margin: 5px 0;
+            padding: 8px;
+            font-size: 14px;
+            width: 100%;
+        }
+
+        .inline {
+            display: flex;
+            gap: 10px;
+        }
+
+        .inline input, .inline button {
+            flex: 1;
+        }
+
+        h3 {
+            font-size: 18px;
+            margin: 10px 0 5px;
+        }
+
+        button {
+            cursor: pointer;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+
+        button:hover {
+            background: #0056b3;
+        }
+
+        #statusPanel {
+            margin-top: 20px;
+            display: flex;
+            gap: 20px;
+        }
+
+        .red {
+            background: #ffe6e6;
+        }
+
+        .green {
+            background: #e6ffe6;
+        }
+
+        .blue {
+            background: #e6f0ff;
+        }
+
+        .gray {
+            background: #f2f2f2;
+        }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <h1>RPS Battle Arena</h1>
+
+    <div id="statusPanel">
+        <div style="flex: 1;">
+            <h3>Game Messages</h3>
+            <div id="messages"></div>
+        </div>
+        <div style="flex: 1;">
+            <h3>Player Status</h3>
+            <div id="playerStatus"></div>
+        </div>
+    </div>
+
+    <h3>Mode</h3>
+    <div class="inline">
+        <button onclick="selectMode('deathmatch')">Deathmatch</button>
+        <button onclick="selectMode('lms')">LMS</button>
+    </div>
+
+    <h3>Challenge</h3>
+    <div class="inline">
+        <input type="text" id="challengeId" placeholder="Player ID">
+        <input type="text" id="yourMove" placeholder="Move (R/P/S)">
+        <button onclick="sendChallenge()">Challenge</button>
+    </div>
+
+    <h3>Reply Move</h3>
+    <div class="inline">
+        <input type="text" id="moveInput" placeholder="Move (R/P/S)">
+        <button onclick="sendMove()">Send Move</button>
+    </div>
+</div>
+
+<script>
+    const socket = new WebSocket('ws://localhost:8080'); // Adjust port if needed
+    let previousStatus = {};
+    let statusBuffer = "";
+    let receivingStatus = false;
+
+    socket.onopen = function () {
+        addMessage('Connected to server.');
+    };
+
+    socket.onmessage = function (event) {
+        const data = event.data.trim();
+        console.log("Received:", data);
+        if (data === "[PLAYER_STATUS]") {
+            statusBuffer = "";
+            receivingStatus = true;
+            return;
+        } else if (data === "[PLAYER_STATUS_END]") {
+            receivingStatus = false;
+            const lines = statusBuffer.trim().split("\n");
+            console.log("Status lines:", lines);
+            updatePlayerStatus(lines);
+            statusBuffer = "";
+            return;
+        }
+        if (receivingStatus) {
+            statusBuffer += data + "\n";
+        } else {
+            addMessage(data); 
+        }
+    };
+
+    function addMessage(msg) {
+        const messagesDiv = document.getElementById('messages');
+        messagesDiv.innerHTML += `<div>${msg}</div>`;
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    function selectMode(mode) {
+        socket.send(`/mode ${mode}`);
+        addMessage(`Mode selected: ${mode}`);
+    }
+
+    function sendChallenge() {
+        const id = document.getElementById('challengeId').value.trim();
+        const move = document.getElementById('yourMove').value.trim().toUpperCase();
+        if (!id || !['R', 'P', 'S'].includes(move)) {
+            alert("Enter valid Player ID and Move (R/P/S)");
+            return;
+        }
+        socket.send(`/challenge ${id} ${move}`);
+        addMessage(`Challenged Player ${id} with ${move}`);
+    }
+
+    function sendMove() {
+        const move = document.getElementById('moveInput').value.trim().toUpperCase();
+        if (!['R', 'P', 'S'].includes(move)) {
+            alert("Enter valid move: R, P, or S");
+            return;
+        }
+        socket.send(`/move ${move}`);
+        addMessage(`Move sent: ${move}`);
+    }
+
+    function updatePlayerStatus(statusLines) {
+    const statusDiv = document.getElementById('playerStatus');
+
+    const lines = statusLines.filter(line => line.trim());
+
+    let html = '';
+    lines.forEach(line => {
+        const parts = line.trim().split('|').map(p => p.trim());
+        const name = parts[0] || "Unknown";
+        const gamesStr = parts[1] || "Games: 0";
+        const winsStr = parts[2] || "Wins: 0";
+        const ratioStr = parts[3] || "Ratio: 0.0";
+        const hpStr = parts.find(p => p.startsWith("HP:")) || "";
+
+        const gamesMatch = gamesStr.match(/\d+/);
+        const winsMatch = winsStr.match(/\d+/);
+        const hpMatch = hpStr.match(/\d+/);
+
+        const games = gamesMatch ? parseInt(gamesMatch[0]) : 0;
+        const wins = winsMatch ? parseInt(winsMatch[0]) : 0;
+        const hp = hpMatch ? parseInt(hpMatch[0]) : 0;
+
+        let colorClass = '';
+        let changeSymbol = '';
+
+        if (previousStatus[name]) {
+            const prev = previousStatus[name];
+            if (hp < prev.hp) {
+                colorClass = 'red';
+                changeSymbol = '↓ HP';
+            } else if (wins > prev.wins) {
+                colorClass = 'green';
+                changeSymbol = '↑ Win';
+            } else if (hp > prev.hp) {
+                colorClass = 'blue';
+                changeSymbol = '↑ HP';
+            }
+        } else {
+            colorClass = 'gray';
+            changeSymbol = 'New';
+        }
+
+        previousStatus[name] = { hp, wins };
+
+        html += `<div class="${colorClass}">
+                    <b>${name}</b> | ${gamesStr} | ${winsStr} | ${ratioStr}
+                    | ${hpStr}
+                    <span style="font-size: 12px; margin-left: 10px;">${changeSymbol}</span>
+                 </div>`;
+    });
+
+    statusDiv.innerHTML = html;
+    statusDiv.scrollTop = statusDiv.scrollHeight;
+}
+
+
+
+
+</script>
+
+</body>
+</html>

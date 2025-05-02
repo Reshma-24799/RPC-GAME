@@ -1,0 +1,3 @@
+/home/reshma/rps_arena/build/CMakeFiles/server.dir
+/home/reshma/rps_arena/build/CMakeFiles/edit_cache.dir
+/home/reshma/rps_arena/build/CMakeFiles/rebuild_cache.dir
