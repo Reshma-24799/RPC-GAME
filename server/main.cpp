@@ -42,9 +42,6 @@ struct Player {
 
 std::atomic<int> global_challenge_id{0};
 
-//A list of active client connections — each shared_ptr<tcp::socket> represents a connected player's socket.
-vector<shared_ptr<tcp::socket>> clients;
-mutex clients_mutex;
 map<int, shared_ptr<Player>> players;
 mutex players_mutex;
 GameMode selected_mode = GameMode::NONE;
@@ -55,12 +52,11 @@ int deathmatch_players_connected = 0;
 bool deathmatch_game_started = false;
 
 void broadcast(const string& message, shared_ptr<tcp::socket> sender) {
-    lock_guard<mutex> lock(clients_mutex);
-    //Without this lock, a client disconnecting mid-broadcast could crash the server.
-    for (auto& client : clients) {
-        if (client != sender) {
+    lock_guard<mutex> lock(players_mutex);
+    for (auto& [id, p] : players) {
+        if (p->socket && p->socket != sender) {
             try {
-                boost::asio::write(*client, boost::asio::buffer(message));
+                boost::asio::write(*p->socket, boost::asio::buffer(message));
             } catch (...) {
                 // Silently fail if client is disconnected
             }
@@ -68,10 +64,10 @@ void broadcast(const string& message, shared_ptr<tcp::socket> sender) {
     }
 }
 void broadcast_to_all(const string& message) {
-    lock_guard<mutex> lock(clients_mutex);
-    for (auto& client : clients) {
+    lock_guard<mutex> lock(players_mutex);
+    for (auto& [id, p] : players) {
         try {
-            boost::asio::write(*client, boost::asio::buffer(message));
+            boost::asio::write(*p->socket, boost::asio::buffer(message));
         } catch (...) {
             // Ignore disconnects
         }
@@ -79,8 +75,10 @@ void broadcast_to_all(const string& message) {
 }
 
 void broadcast_player_status() {
+    string list ="";
+    {
     lock_guard<mutex> lock(players_mutex);
-    string list = "[PLAYER_STATUS]\n";
+    list = "[PLAYER_STATUS]\n";
     for (auto& [id, p] : players) {
         try{
             if (!p) {
@@ -99,6 +97,7 @@ void broadcast_player_status() {
     }
  
     list += "[PLAYER_STATUS_END]\n";
+    }
     broadcast_to_all(list);
 }
 void check_lms_game_end() {
@@ -118,78 +117,66 @@ void check_lms_game_end() {
         broadcast_player_status();
     }
 }
-
-void challenge_timeout(shared_ptr<Player> challenger, shared_ptr<Player> challenged,  int challenge_id) {
+void challenge_timeout(shared_ptr<Player> challenger, shared_ptr<Player> challenged, int challenge_id) {
     this_thread::sleep_for(chrono::seconds(10));
     // If the challenged player hasn't responded, challenger wins by timeout
     bool timeoutOccurred = false;
+    // Lock only the critical section where data is being modified
     {
         lock_guard<mutex> lock(players_mutex);
         if (challenger->in_match && challenged->in_match 
             && challenger->challenge_id == challenge_id 
-            && challenged->challenge_id == challenge_id 
-            && !challenged->challenge_responded) {
-    
+            && challenged->challenge_id == challenge_id) {
             timeoutOccurred = true;
             challenger->num_games_played++;
             challenged->num_games_played++;
-            
             if (selected_mode == GameMode::LAST_MAN_STANDING && lms_game_started) {
                 challenger->games_won++;
                 challenger->current_winstreak++;
                 challenged->hp--;
-                string timeout_msg = challenged->name + " lost 1 HP by timeout! Remaining HP: " + to_string(challenged->hp) + "\n";
-                broadcast(timeout_msg, nullptr);
-                if (challenger->current_winstreak == 3 && challenger->hp > 0) {
-                    challenger->hp++;
-                    broadcast("🔥 Killing Spree! " + challenger->name + " gains +1 HP! 🔥\n", nullptr);
-                    challenger->current_winstreak = 0;
-                }
+                challenged->in_match = false;
                 if (challenged->hp <= 0) {
-                    string dead_msg = challenged->name + " has died.\n";
-                    broadcast(dead_msg, nullptr);
                     challenged->in_match = true;
                 }
-                check_lms_game_end();
-                
             } else {
-               
                 challenger->games_won++;
-                string timeout_msg = "Match Result: " + challenger->name + " wins by timeout (no response from " +
-                challenged->name + ")\n";
-                broadcast(timeout_msg, nullptr);
-                
-    
                 challenged->in_match = false;
                 challenged->challenged_by = -1;
                 challenged->challenge_responded = false;
-             
             }
-            
-    
-            // Reset match state
+            // Reset match state for challenger
             challenger->in_match = false;
             challenger->pending_choice = '\0';
-            
         }
     }
     if (timeoutOccurred) {
+        string timeout_msg;
+        if (selected_mode == GameMode::LAST_MAN_STANDING && lms_game_started) {
+            timeout_msg = challenged->name + " lost 1 HP by timeout! Remaining HP: " + to_string(challenged->hp) + "\n";
+            if (challenger->current_winstreak == 3 && challenger->hp > 0) {
+                challenger->hp++;
+                broadcast("🔥 Killing Spree! " + challenger->name + " gains +1 HP! 🔥\n", nullptr);
+                challenger->current_winstreak = 0;
+            }
+            if (challenged->hp <= 0) {
+                string dead_msg = challenged->name + " has died.\n";
+                broadcast(dead_msg, nullptr);
+            }
+            check_lms_game_end();
+        } else {
+            timeout_msg = "Match Result: " + challenger->name + " wins by timeout (no response from " +
+                          challenged->name + ")\n";
+        }
+
+        broadcast(timeout_msg, nullptr);
         broadcast_player_status(); 
     }
 }
 
 void handle_client(shared_ptr<tcp::socket> socket, int player_id) {
-    //streambuf contains a chunk of memory that you can use to temporarily hold input or output data.
     boost::asio::streambuf buffer;
-    //This line creates an input stream (like cin) that reads from the streambuf.
     istream input(&buffer);
    
-    //This section safely adds the new player's socket to the global clients list.
-   //lock_guard<mutex> ensures that this operation is thread-safe — only one thread can modify clients at a time.
-    {
-        lock_guard<mutex> lock(clients_mutex);
-        clients.push_back(socket);
-    }
 
     // Register the player
     auto player = make_shared<Player>();
@@ -200,7 +187,7 @@ void handle_client(shared_ptr<tcp::socket> socket, int player_id) {
     {
         // This ensures only one thread at a time can modify or read from players.
         lock_guard<mutex> lock(players_mutex);
-        players[player_id] = player;
+        players.emplace(player_id, player);
     }
 
     string join_msg = player->name + " joined the chat.\n";
@@ -296,16 +283,23 @@ void handle_client(shared_ptr<tcp::socket> socket, int player_id) {
                     char reply_move;
                     ss >> cmd >> reply_move;
 
-                    if (player->challenged_by != -1) {
+                    string summary;
+                    string kill_msg1, kill_msg2, killstreak_msg;
+                    bool should_broadcast = false;
+                    bool broadcast_status = false;
+                    shared_ptr<Player> challenger;
+                    char initiator_move;
+                    string result;
+                    {
                         lock_guard<mutex> lock(players_mutex);
-                        auto challenger = players[player->challenged_by];
-                        char initiator_move = challenger->pending_choice;
+                        if (player->challenged_by != -1) {
+                            challenger = players[player->challenged_by];
+                            initiator_move = challenger->pending_choice;
 
-                        string result;
                         if (initiator_move == reply_move) result = "draw";
                         else if ((initiator_move == 'R' && reply_move == 'S') ||
-                                 (initiator_move == 'P' && reply_move == 'R') ||
-                                 (initiator_move == 'S' && reply_move == 'P')) {
+                                (initiator_move == 'P' && reply_move == 'R') ||
+                                (initiator_move == 'S' && reply_move == 'P')) {
                             result = "initiator";
                         } else {
                             result = "challenged";
@@ -323,7 +317,7 @@ void handle_client(shared_ptr<tcp::socket> socket, int player_id) {
 
                                 if (challenger->current_winstreak == 3 && challenger->hp > 0) {
                                     challenger->hp++;
-                                    broadcast("🔥 Killing Spree! " + challenger->name + " gains +1 HP! 🔥\n", nullptr);
+                                    killstreak_msg = "🔥 Killing Spree! " + challenger->name + " gains +1 HP! 🔥\n";
                                     challenger->current_winstreak = 0;
                                 }
                             } else if (result == "challenged") {
@@ -334,36 +328,27 @@ void handle_client(shared_ptr<tcp::socket> socket, int player_id) {
 
                                 if (player->current_winstreak == 3 && player->hp > 0) {
                                     player->hp++;
-                                    broadcast("🔥 Killing Spree! " + player->name + " gains +1 HP! 🔥\n", nullptr);
+                                    killstreak_msg = "🔥 Killing Spree! " + player->name + " gains +1 HP! 🔥\n";
                                     player->current_winstreak = 0;
                                 }
                             } else {
                                 challenger->current_winstreak = 0;
                                 player->current_winstreak = 0;
                             }
-                           
-                            if (challenger->hp <= 0){
-                                broadcast(challenger->name + " has died.\n", nullptr);
-                            } 
-                            if (player->hp <= 0){
-                                broadcast(player->name + " has died.\n", nullptr);
-                            } 
+                                if (challenger->hp <= 0) kill_msg1 = challenger->name + " has died.\n";
+                                if (player->hp <= 0) kill_msg2 = player->name + " has died.\n";
 
-                            check_lms_game_end();
                         } else {
                             if (result == "initiator") challenger->games_won++;
                             else if (result == "challenged") player->games_won++;
                         }
 
-                        
-                        string summary = "Match Result: " + challenger->name + " (" + initiator_move + ") vs "
-                                         + player->name + " (" + reply_move + ") — ";
-                        summary += (result == "draw" ? "It's a draw!" :
-                                    (result == "initiator" ? challenger->name + " wins!" : player->name + " wins!")) + "\n";
+                        summary = "Match Result: " + challenger->name + " (" + initiator_move + ") vs "
+                            + player->name + " (" + reply_move + ") — "
+                            + (result == "draw" ? "It's a draw!" :
+                            (result == "initiator" ? challenger->name + " wins!" : player->name + " wins!")) + "\n";
 
-                        broadcast(summary, nullptr);
-                        
-                        // Reset challenge state
+                        // Reset match state
                         challenger->in_match = false;
                         player->in_match = false;
                         challenger->pending_choice = '\0';
@@ -371,12 +356,21 @@ void handle_client(shared_ptr<tcp::socket> socket, int player_id) {
                         challenger->challenge_responded = false;
                         player->challenge_responded = true;
 
-
+                        should_broadcast = true;
+                        broadcast_status = true;
+                        }
+                    } 
+                    if (should_broadcast) {
+                        broadcast(summary, nullptr);
+                        if (!killstreak_msg.empty()) broadcast(killstreak_msg, nullptr);
+                        if (!kill_msg1.empty()) broadcast(kill_msg1, nullptr);
+                        if (!kill_msg2.empty()) broadcast(kill_msg2, nullptr);
+                        check_lms_game_end();
                     }
-                    broadcast_player_status();
-
+                    if (broadcast_status) {
+                        broadcast_player_status();
+                    }
                 }
-
                 // Otherwise: treat it as chat
                 else {
                     string full_msg = "[" + player->name + "]: " + msg + "\n";
@@ -392,10 +386,6 @@ void handle_client(shared_ptr<tcp::socket> socket, int player_id) {
     string leave_msg = player->name + " left the chat.\n";
     broadcast(leave_msg, socket);
 
-    {
-        lock_guard<mutex> lock(clients_mutex);
-        clients.erase(remove(clients.begin(), clients.end(), socket), clients.end());
-    }
 
     {
         lock_guard<mutex> lock(players_mutex);
